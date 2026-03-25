@@ -57,7 +57,7 @@ async function geminiGet(endpoint) {
 
 const server = new McpServer({
   name: "gemini-mcp",
-  version: "1.1.0",
+  version: "1.2.0",
 });
 
 // ── Tool: Generate Image (Imagen 4) ────────────────────────
@@ -138,6 +138,112 @@ server.tool(
           },
         ],
       };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+// ── Tool: Native Image Gen/Edit (Nano Banana) ──────────────
+
+server.tool(
+  "gemini_native_image",
+  "Generate or edit images using Gemini 3.1 Flash Image (Nano Banana). Supports text-to-image, image editing via instructions, multi-turn refinement, and up to 4K output. Saves PNG to ~/Desktop/gemini-outputs/.",
+  {
+    prompt: z.string().describe("Text description or editing instruction for the image"),
+    aspectRatio: z
+      .enum(["1:1", "1:4", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"])
+      .default("1:1")
+      .describe("Aspect ratio (more options than Imagen)"),
+    imageSize: z
+      .enum(["512", "1K", "2K", "4K"])
+      .default("1K")
+      .describe("Output resolution"),
+    inputImagePath: z
+      .string()
+      .optional()
+      .describe("Optional: absolute path to an image file to edit/modify"),
+  },
+  async ({ prompt, aspectRatio, imageSize, inputImagePath }) => {
+    if (!GEMINI_API_KEY) {
+      return { content: [{ type: "text", text: "Error: GEMINI_API_KEY environment variable is not set." }] };
+    }
+
+    try {
+      // Build content parts
+      const parts = [];
+
+      // If an input image is provided, include it
+      if (inputImagePath) {
+        const imgPath = inputImagePath.replace(/^~/, os.homedir());
+        if (!fs.existsSync(imgPath)) {
+          return { content: [{ type: "text", text: `Error: File not found: ${imgPath}` }] };
+        }
+        const imgBytes = fs.readFileSync(imgPath);
+        const ext = path.extname(imgPath).toLowerCase();
+        const mimeMap = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif" };
+        const mimeType = mimeMap[ext] || "image/png";
+        parts.push({
+          inline_data: {
+            mime_type: mimeType,
+            data: imgBytes.toString("base64"),
+          },
+        });
+      }
+
+      parts.push({ text: prompt });
+
+      const data = await geminiRequest(
+        "/models/gemini-3.1-flash-image-preview:generateContent",
+        {
+          contents: [{ role: "user", parts }],
+          generationConfig: {
+            responseModalities: ["TEXT", "IMAGE"],
+            imageConfig: {
+              aspectRatio,
+              imageSize,
+            },
+          },
+        }
+      );
+
+      // Extract images from response
+      const candidate = data.candidates?.[0];
+      if (!candidate?.content?.parts) {
+        return { content: [{ type: "text", text: "No content returned. The prompt may have been blocked by safety filters." }] };
+      }
+
+      const outputDir = getOutputDir();
+      const savedFiles = [];
+      const textParts = [];
+
+      for (const part of candidate.content.parts) {
+        if (part.text) {
+          textParts.push(part.text);
+        }
+        if (part.inline_data) {
+          const buffer = Buffer.from(part.inline_data.data, "base64");
+          const ext = part.inline_data.mime_type === "image/jpeg" ? "jpg" : "png";
+          const filename = `nanob-${timestamp()}-${savedFiles.length + 1}.${ext}`;
+          const filepath = path.join(outputDir, filename);
+          fs.writeFileSync(filepath, buffer);
+          savedFiles.push(filepath);
+        }
+      }
+
+      if (savedFiles.length === 0) {
+        const msg = textParts.length > 0
+          ? `No images generated. Model response: ${textParts.join(" ")}`
+          : "No images returned. Try rephrasing the prompt.";
+        return { content: [{ type: "text", text: msg }] };
+      }
+
+      let result = `Generated ${savedFiles.length} image(s):\n${savedFiles.join("\n")}`;
+      if (textParts.length > 0) {
+        result += `\n\nModel notes: ${textParts.join(" ")}`;
+      }
+
+      return { content: [{ type: "text", text: result }] };
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${err.message}` }] };
     }
