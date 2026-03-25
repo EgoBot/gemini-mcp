@@ -1,0 +1,10 @@
+{
+  "name": "gemini-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Gemini image and video generation",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  }
+}
