@@ -381,9 +381,9 @@ server.tool(
       .optional()
       .describe("Optional: describe unwanted elements as nouns (e.g. 'blur, text, watermark')"),
     personGeneration: z
-      .enum(["dont_allow", "allow_adult", "allow_all"])
-      .default("dont_allow")
-      .describe("Person/face generation policy"),
+      .enum(["allow_all"])
+      .default("allow_all")
+      .describe("Person/face generation policy (only allow_all is currently supported)"),
     seed: z
       .number()
       .int()
@@ -475,8 +475,10 @@ server.tool(
         const videoUri = samples[i].video?.uri;
         if (!videoUri) continue;
 
-        const downloadUrl = `${videoUri}?alt=media&key=${GEMINI_API_KEY}`;
-        const videoRes = await fetch(downloadUrl);
+        const videoRes = await fetch(videoUri, {
+          headers: { "x-goog-api-key": GEMINI_API_KEY },
+          redirect: "follow",
+        });
         if (!videoRes.ok) {
           throw new Error(`Failed to download video: ${videoRes.status}`);
         }
