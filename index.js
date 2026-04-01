@@ -8,6 +8,34 @@ import os from "os";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
+// ── Usage Logging ───────────────────────────────────────────
+
+const USAGE_LOG_PATH = path.join(os.homedir(), "Desktop", "gemini-outputs", "usage-log.jsonl");
+
+// Pricing table (USD) — update if Google changes rates
+const PRICING = {
+  "imagen-4.0-generate-001": { "1K": 0.04, "2K": 0.06 },          // per image
+  "gemini-3.1-flash-image-preview": { "512": 0.04, "1K": 0.04, "2K": 0.134, "4K": 0.24 }, // per image
+  "veo-3.1-generate-001": { perSecond: 0.15 },                 // per second (fast, with audio)
+};
+
+function logUsage({ tool, model, params, outputCount, estimatedCost }) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    tool,
+    model,
+    params,
+    outputCount,
+    estimatedCost: Math.round(estimatedCost * 1000) / 1000,
+  };
+  try {
+    fs.mkdirSync(path.dirname(USAGE_LOG_PATH), { recursive: true });
+    fs.appendFileSync(USAGE_LOG_PATH, JSON.stringify(entry) + "\n");
+  } catch (e) {
+    // Don't fail the generation if logging fails
+  }
+}
+
 // ── Helpers ─────────────────────────────────────────────────
 
 function getOutputDir() {
@@ -177,6 +205,16 @@ server.tool(
         return { content: [{ type: "text", text: "Images were returned but could not be decoded." }] };
       }
 
+      // Log usage
+      const pricePerImage = PRICING["imagen-4.0-generate-001"][imageSize] || 0.04;
+      logUsage({
+        tool: "gemini_generate_image",
+        model: "imagen-4.0-generate-001",
+        params: { sampleCount, aspectRatio, imageSize, personGeneration, hasReference: !!referenceImagePath },
+        outputCount: savedFiles.length,
+        estimatedCost: savedFiles.length * pricePerImage,
+      });
+
       return {
         content: [{ type: "text", text: `Generated ${savedFiles.length} image(s):\n${savedFiles.join("\n")}` }],
       };
@@ -255,7 +293,16 @@ server.tool(
 
       const candidate = data.candidates?.[0];
       if (!candidate?.content?.parts) {
-        return { content: [{ type: "text", text: "No content returned. The prompt may have been blocked by safety filters." }] };
+        // Debug: show what the API actually returned
+        const debugInfo = JSON.stringify({
+          hasData: !!data,
+          hasCandidates: !!data?.candidates,
+          candidateCount: data?.candidates?.length,
+          finishReason: candidate?.finishReason,
+          blockReason: data?.promptFeedback?.blockReason,
+          safetyRatings: candidate?.safetyRatings || data?.promptFeedback?.safetyRatings,
+        }, null, 2);
+        return { content: [{ type: "text", text: `No content returned. Debug: ${debugInfo}` }] };
       }
 
       const outputDir = getOutputDir();
@@ -277,11 +324,22 @@ server.tool(
       }
 
       if (savedFiles.length === 0) {
+        const partTypes = candidate.content.parts.map(p => Object.keys(p).join(","));
         const msg = textParts.length > 0
-          ? `No images generated. Model response: ${textParts.join(" ")}`
-          : "No images returned. Try rephrasing the prompt.";
+          ? `No images generated. Model response: ${textParts.join(" ")} | Part types: ${partTypes.join("; ")}`
+          : `No images returned. Part types found: ${partTypes.join("; ")} | finishReason: ${candidate.finishReason}`;
         return { content: [{ type: "text", text: msg }] };
       }
+
+      // Log usage
+      const nanoPricePerImage = PRICING["gemini-3.1-flash-image-preview"][imageSize] || 0.04;
+      logUsage({
+        tool: "gemini_native_image",
+        model: "gemini-3.1-flash-image-preview",
+        params: { aspectRatio, imageSize, personGeneration, inputImageCount: inputImagePaths?.length || 0 },
+        outputCount: savedFiles.length,
+        estimatedCost: savedFiles.length * nanoPricePerImage,
+      });
 
       let result = `Generated ${savedFiles.length} image(s):\n${savedFiles.join("\n")}`;
       if (textParts.length > 0) {
@@ -360,7 +418,6 @@ server.tool(
 
       // Build parameters
       const parameters = {
-        numberOfVideos: 1,
         durationSeconds: duration,
         aspectRatio,
         resolution,
@@ -377,7 +434,7 @@ server.tool(
 
       // Step 1: Submit generation request
       const operation = await geminiRequest(
-        "/models/veo-3.1-generate-preview:predictLongRunning",
+        "/models/veo-3.1-generate-001:predictLongRunning",
         { instances: [instance], parameters }
       );
 
@@ -430,6 +487,16 @@ server.tool(
         fs.writeFileSync(filepath, videoBuffer);
         savedFiles.push(filepath);
       }
+
+      // Log usage
+      const veoPricePerSec = PRICING["veo-3.1-generate-001"].perSecond || 0.15;
+      logUsage({
+        tool: "gemini_generate_video",
+        model: "veo-3.1-generate-001",
+        params: { durationSeconds: duration, aspectRatio, resolution, personGeneration, hasStartFrame: !!inputImagePath },
+        outputCount: savedFiles.length,
+        estimatedCost: savedFiles.length * duration * veoPricePerSec,
+      });
 
       return {
         content: [{ type: "text", text: `Generated ${savedFiles.length} video(s):\n${savedFiles.join("\n")}` }],
