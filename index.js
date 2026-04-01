@@ -16,7 +16,7 @@ const USAGE_LOG_PATH = path.join(os.homedir(), "Desktop", "gemini-outputs", "usa
 const PRICING = {
   "imagen-4.0-generate-001": { "1K": 0.04, "2K": 0.06 },          // per image
   "gemini-3.1-flash-image-preview": { "512": 0.04, "1K": 0.04, "2K": 0.134, "4K": 0.24 }, // per image
-  "veo-3.1-generate-001": { perSecond: 0.15 },                 // per second (fast, with audio)
+  "veo-3.1-generate-preview": { perSecond: 0.15 },                 // per second (fast, with audio)
 };
 
 function logUsage({ tool, model, params, outputCount, estimatedCost }) {
@@ -434,7 +434,7 @@ server.tool(
 
       // Step 1: Submit generation request
       const operation = await geminiRequest(
-        "/models/veo-3.1-generate-001:predictLongRunning",
+        "/models/veo-3.1-generate-preview:predictLongRunning",
         { instances: [instance], parameters }
       );
 
@@ -489,10 +489,10 @@ server.tool(
       }
 
       // Log usage
-      const veoPricePerSec = PRICING["veo-3.1-generate-001"].perSecond || 0.15;
+      const veoPricePerSec = PRICING["veo-3.1-generate-preview"].perSecond || 0.15;
       logUsage({
         tool: "gemini_generate_video",
-        model: "veo-3.1-generate-001",
+        model: "veo-3.1-generate-preview",
         params: { durationSeconds: duration, aspectRatio, resolution, personGeneration, hasStartFrame: !!inputImagePath },
         outputCount: savedFiles.length,
         estimatedCost: savedFiles.length * duration * veoPricePerSec,
