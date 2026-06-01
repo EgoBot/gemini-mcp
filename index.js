@@ -16,7 +16,15 @@ const USAGE_LOG_PATH = path.join(os.homedir(), "Desktop", "gemini-outputs", "usa
 const PRICING = {
   "imagen-4.0-generate-001": { "1K": 0.04, "2K": 0.06 },          // per image
   "gemini-3.1-flash-image-preview": { "512": 0.04, "1K": 0.04, "2K": 0.134, "4K": 0.24 }, // per image
-  "veo-3.1-generate-preview": { perSecond: 0.15 },                 // per second (fast, with audio)
+  "veo-3.1-generate-preview": { perSecond: 0.40 },                 // quality, with audio
+  "veo-3.1-fast-generate-preview": { perSecond: 0.15 },            // fast, with audio
+  "veo-3.1-lite-generate-preview": { perSecond: 0.08 },            // lite (estimate; verify)
+};
+
+const VEO_MODELS = {
+  quality: "veo-3.1-generate-preview",
+  fast: "veo-3.1-fast-generate-preview",
+  lite: "veo-3.1-lite-generate-preview",
 };
 
 function logUsage({ tool, model, params, outputCount, estimatedCost }) {
@@ -57,11 +65,29 @@ function timestamp() {
 }
 
 function readImageAsBase64(filePath) {
-  const resolved = filePath.replace(/^~/, os.homedir());
+  const resolved = path.resolve(filePath.replace(/^~/, os.homedir()));
   if (!fs.existsSync(resolved)) {
     throw new Error(`File not found: ${resolved}`);
   }
-  const bytes = fs.readFileSync(resolved);
+  let bytes;
+  try {
+    bytes = fs.readFileSync(resolved);
+  } catch (err) {
+    if (err.code === "EPERM" || err.code === "EACCES") {
+      // macOS may restrict access via extended attributes (com.apple.macl)
+      // even when the file is owner-readable. Check for ACL attributes.
+      throw new Error(
+        `Permission denied reading ${resolved}. ` +
+        `This is usually a macOS privacy restriction (com.apple.macl extended attribute) ` +
+        `on a parent directory, not a file-permission issue. ` +
+        `To fix: (1) remove the attribute with \`xattr -rd com.apple.macl <parent-dir>\`, ` +
+        `(2) grant Full Disk Access to your terminal/Node binary in System Settings → Privacy & Security → Full Disk Access, ` +
+        `or (3) copy the file to ~/Desktop/gemini-outputs/ and pass that path instead. ` +
+        `Original error: ${err.message}`
+      );
+    }
+    throw err;
+  }
   const ext = path.extname(resolved).toLowerCase();
   const mimeMap = {
     ".png": "image/png",
@@ -111,7 +137,7 @@ const server = new McpServer({
 
 server.tool(
   "gemini_generate_image",
-  "Generate images using Google Imagen 4. Supports text-to-image and image references (style/subject). Saves PNG to ~/Desktop/gemini-outputs/.",
+  "Generate images using Google Imagen 4 (text-to-image only). For reference-image-guided generation, use gemini_native_image instead. Saves PNG to ~/Desktop/gemini-outputs/.",
   {
     prompt: z.string().describe("Text description of the image to generate"),
     aspectRatio: z
@@ -129,10 +155,6 @@ server.tool(
       .enum(["1K", "2K"])
       .default("1K")
       .describe("Output resolution: 1K or 2K"),
-    referenceImagePath: z
-      .string()
-      .optional()
-      .describe("Optional: path to a reference image for style or subject guidance"),
     personGeneration: z
       .enum(["dont_allow", "allow_adult", "allow_all"])
       .default("allow_adult")
@@ -143,22 +165,13 @@ server.tool(
       .optional()
       .describe("Optional: seed for reproducible generation (disables watermark)"),
   },
-  async ({ prompt, aspectRatio, sampleCount, imageSize, referenceImagePath, personGeneration, seed }) => {
+  async ({ prompt, aspectRatio, sampleCount, imageSize, personGeneration, seed }) => {
     if (!GEMINI_API_KEY) {
       return { content: [{ type: "text", text: "Error: GEMINI_API_KEY environment variable is not set." }] };
     }
 
     try {
       const instance = { prompt };
-
-      // Add reference image if provided
-      if (referenceImagePath) {
-        const img = readImageAsBase64(referenceImagePath);
-        instance.image = {
-          bytesBase64Encoded: img.data,
-          mimeType: img.mimeType,
-        };
-      }
 
       const parameters = {
         sampleCount,
@@ -210,7 +223,7 @@ server.tool(
       logUsage({
         tool: "gemini_generate_image",
         model: "imagen-4.0-generate-001",
-        params: { sampleCount, aspectRatio, imageSize, personGeneration, hasReference: !!referenceImagePath },
+        params: { sampleCount, aspectRatio, imageSize, personGeneration },
         outputCount: savedFiles.length,
         estimatedCost: savedFiles.length * pricePerImage,
       });
@@ -313,13 +326,19 @@ server.tool(
         if (part.text) {
           textParts.push(part.text);
         }
-        if (part.inline_data) {
-          const buffer = Buffer.from(part.inline_data.data, "base64");
-          const ext = part.inline_data.mime_type === "image/jpeg" ? "jpg" : "png";
-          const filename = `nanob-${timestamp()}-${savedFiles.length + 1}.${ext}`;
-          const filepath = path.join(outputDir, filename);
-          fs.writeFileSync(filepath, buffer);
-          savedFiles.push(filepath);
+        // Gemini API returns camelCase (inlineData), not snake_case (inline_data)
+        const imageData = part.inline_data || part.inlineData;
+        if (imageData) {
+          const mimeType = imageData.mime_type || imageData.mimeType || "image/png";
+          const b64 = imageData.data;
+          if (b64) {
+            const buffer = Buffer.from(b64, "base64");
+            const ext = mimeType === "image/jpeg" ? "jpg" : "png";
+            const filename = `nanob-${timestamp()}-${savedFiles.length + 1}.${ext}`;
+            const filepath = path.join(outputDir, filename);
+            fs.writeFileSync(filepath, buffer);
+            savedFiles.push(filepath);
+          }
         }
       }
 
@@ -357,13 +376,17 @@ server.tool(
 
 server.tool(
   "gemini_generate_video",
-  "Generate a video using Google Veo 3.1 with native audio. Supports text-to-video and image-to-video (start frame). Saves MP4 to ~/Desktop/gemini-outputs/.",
+  "Generate a video using Google Veo 3.1 with native audio. Supports text-to-video, image-to-video (start frame), first+last frame interpolation (seamless loops), reference-image character/style consistency (ingredients-to-video, up to 3), and extension of a previous Veo-generated video URI. Saves MP4 to ~/Desktop/gemini-outputs/ unless outputDir is set.",
   {
     prompt: z.string().describe("Text description of the video to generate"),
+    model: z
+      .enum(["quality", "fast", "lite"])
+      .default("quality")
+      .describe("Veo 3.1 variant: quality (best), fast (cheaper, faster), lite (cheapest, no reference/extension)"),
     durationSeconds: z
       .enum(["4", "6", "8"])
       .default("6")
-      .describe("Video duration: 4, 6, or 8 seconds"),
+      .describe("Video duration: 4, 6, or 8 seconds. Forced to 8 when using 1080p/4k, referenceImages, or extension."),
     aspectRatio: z
       .enum(["9:16", "16:9"])
       .default("16:9")
@@ -371,35 +394,63 @@ server.tool(
     resolution: z
       .enum(["720p", "1080p", "4k"])
       .default("720p")
-      .describe("Video resolution (1080p and 4k require 8s duration)"),
+      .describe("Video resolution (1080p and 4k require 8s duration; extension forces 720p)"),
     inputImagePath: z
       .string()
       .optional()
       .describe("Optional: path to a start-frame image for image-to-video animation"),
-    negativePrompt: z
+    lastFramePath: z
       .string()
       .optional()
-      .describe("Optional: describe unwanted elements as nouns (e.g. 'blur, text, watermark')"),
-    personGeneration: z
-      .enum(["allow_all"])
-      .default("allow_all")
-      .describe("Person/face generation policy (only allow_all is currently supported)"),
-    seed: z
-      .number()
-      .int()
+      .describe("Optional: path to an end-frame image. Requires inputImagePath. Use same image for both to make a seamless loop, and include 'a seamless loop' in the prompt."),
+    referenceImagePaths: z
+      .array(z.string())
+      .max(3)
       .optional()
-      .describe("Optional: seed for reproducible generation (0-4294967295)"),
+      .describe("Optional: up to 3 reference images for character/object/scene consistency (ingredients-to-video). Not supported on the 'lite' model. Forces durationSeconds=8."),
+    extendFromVideoUri: z
+      .string()
+      .optional()
+      .describe("Optional: URI of a previously-generated Veo video to extend (returned from a prior call; valid for 2 days). Forces 720p and durationSeconds=8. Not supported on the 'lite' model."),
+    personGeneration: z
+      .enum(["dont_allow", "allow_adult", "allow_all"])
+      .default("allow_adult")
+      .describe("Person/face generation policy. Forced to allow_adult for image-to-video, interpolation, and EU/UK/CH/MENA regions."),
+    outputDir: z
+      .string()
+      .optional()
+      .describe("Optional: absolute path to write MP4(s) to. Defaults to ~/Desktop/gemini-outputs/."),
   },
-  async ({ prompt, durationSeconds, aspectRatio, resolution, inputImagePath, negativePrompt, personGeneration, seed }) => {
+  async ({ prompt, model, durationSeconds, aspectRatio, resolution, inputImagePath, lastFramePath, referenceImagePaths, extendFromVideoUri, personGeneration, outputDir }, extra) => {
     if (!GEMINI_API_KEY) {
       return { content: [{ type: "text", text: "Error: GEMINI_API_KEY environment variable is not set." }] };
     }
 
-    const duration = parseInt(durationSeconds, 10);
+    const modelId = VEO_MODELS[model];
+    const usingReferences = referenceImagePaths && referenceImagePaths.length > 0;
+    const usingExtension = !!extendFromVideoUri;
+    const usingLastFrame = !!lastFramePath;
 
-    if ((resolution === "1080p" || resolution === "4k") && duration !== 8) {
+    // ── Constraint validation ────────────────────────────────
+    if (usingLastFrame && !inputImagePath) {
+      return { content: [{ type: "text", text: "Error: lastFramePath requires inputImagePath (first/last frame interpolation needs both ends)." }] };
+    }
+    if (model === "lite" && (usingReferences || usingExtension)) {
+      return { content: [{ type: "text", text: "Error: referenceImages and extension are not supported on the 'lite' model. Use 'quality' or 'fast'." }] };
+    }
+    if (usingExtension && resolution !== "720p") {
+      return { content: [{ type: "text", text: "Error: video extension requires resolution='720p'." }] };
+    }
+
+    // Forced-to-8s combos
+    let duration = parseInt(durationSeconds, 10);
+    const force8Reasons = [];
+    if (resolution === "1080p" || resolution === "4k") force8Reasons.push(resolution);
+    if (usingReferences) force8Reasons.push("referenceImages");
+    if (usingExtension) force8Reasons.push("extension");
+    if (force8Reasons.length > 0 && duration !== 8) {
       return {
-        content: [{ type: "text", text: `Error: ${resolution} resolution requires 8 second duration.` }],
+        content: [{ type: "text", text: `Error: ${force8Reasons.join(", ")} require durationSeconds=8 (got ${duration}).` }],
       };
     }
 
@@ -416,6 +467,31 @@ server.tool(
         };
       }
 
+      // First/last frame interpolation
+      if (usingLastFrame) {
+        const img = readImageAsBase64(lastFramePath);
+        instance.lastFrame = {
+          bytesBase64Encoded: img.data,
+          mimeType: img.mimeType,
+        };
+      }
+
+      // Ingredients-to-video (reference images for consistency)
+      if (usingReferences) {
+        instance.referenceImages = referenceImagePaths.map((p) => {
+          const img = readImageAsBase64(p);
+          return {
+            image: { bytesBase64Encoded: img.data, mimeType: img.mimeType },
+            referenceType: "asset",
+          };
+        });
+      }
+
+      // Scene extension (continue a prior Veo video)
+      if (usingExtension) {
+        instance.video = { uri: extendFromVideoUri, mimeType: "video/mp4" };
+      }
+
       // Build parameters
       const parameters = {
         durationSeconds: duration,
@@ -424,17 +500,9 @@ server.tool(
         personGeneration,
       };
 
-      if (negativePrompt) {
-        parameters.negativePrompt = negativePrompt;
-      }
-
-      if (seed !== undefined) {
-        parameters.seed = seed;
-      }
-
       // Step 1: Submit generation request
       const operation = await geminiRequest(
-        "/models/veo-3.1-generate-preview:predictLongRunning",
+        `/models/${modelId}:predictLongRunning`,
         { instances: [instance], parameters }
       );
 
@@ -443,14 +511,46 @@ server.tool(
       }
 
       // Step 2: Poll for completion (max 7 minutes)
+      // Send progress notifications to keep the MCP client connection alive
       const maxWaitMs = 7 * 60 * 1000;
       const pollIntervalMs = 5000;
       const startTime = Date.now();
       let result;
+      let pollCount = 0;
+
+      const progressToken = extra?._meta?.progressToken;
 
       while (Date.now() - startTime < maxWaitMs) {
         await new Promise((r) => setTimeout(r, pollIntervalMs));
         result = await geminiGet(operation.name);
+        pollCount++;
+
+        // Send progress notification to prevent client timeout
+        try {
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          if (progressToken !== undefined) {
+            await extra.sendNotification({
+              method: "notifications/progress",
+              params: {
+                progressToken,
+                progress: Math.min(pollCount * 5, 95),
+                total: 100,
+                message: `Generating video... (${elapsed}s)`,
+              },
+            });
+          }
+          // Also send a log notification as a keep-alive signal
+          await extra.sendNotification({
+            method: "notifications/message",
+            params: {
+              level: "info",
+              data: `Video generation in progress... (${elapsed}s)`,
+            },
+          });
+        } catch {
+          // Don't fail if notification sending fails
+        }
+
         if (result.done) break;
       }
 
@@ -468,12 +568,16 @@ server.tool(
         return { content: [{ type: "text", text: "No video returned. The prompt may have been blocked by safety filters." }] };
       }
 
-      const outputDir = getOutputDir();
+      const resolvedOutputDir = outputDir
+        ? (fs.mkdirSync(path.resolve(outputDir.replace(/^~/, os.homedir())), { recursive: true }), path.resolve(outputDir.replace(/^~/, os.homedir())))
+        : getOutputDir();
       const savedFiles = [];
+      const videoUris = [];
 
       for (let i = 0; i < samples.length; i++) {
         const videoUri = samples[i].video?.uri;
         if (!videoUri) continue;
+        videoUris.push(videoUri);
 
         const videoRes = await fetch(videoUri, {
           headers: { "x-goog-api-key": GEMINI_API_KEY },
@@ -484,24 +588,37 @@ server.tool(
         }
 
         const videoBuffer = Buffer.from(await videoRes.arrayBuffer());
-        const filename = `veo3-${timestamp()}-${i + 1}.mp4`;
-        const filepath = path.join(outputDir, filename);
+        const filename = `veo3-${model}-${timestamp()}-${i + 1}.mp4`;
+        const filepath = path.join(resolvedOutputDir, filename);
         fs.writeFileSync(filepath, videoBuffer);
         savedFiles.push(filepath);
       }
 
       // Log usage
-      const veoPricePerSec = PRICING["veo-3.1-generate-preview"].perSecond || 0.15;
+      const veoPricePerSec = PRICING[modelId]?.perSecond ?? 0.15;
       logUsage({
         tool: "gemini_generate_video",
-        model: "veo-3.1-generate-preview",
-        params: { durationSeconds: duration, aspectRatio, resolution, personGeneration, hasStartFrame: !!inputImagePath },
+        model: modelId,
+        params: {
+          durationSeconds: duration,
+          aspectRatio,
+          resolution,
+          personGeneration,
+          hasStartFrame: !!inputImagePath,
+          hasLastFrame: usingLastFrame,
+          referenceImageCount: usingReferences ? referenceImagePaths.length : 0,
+          isExtension: usingExtension,
+        },
         outputCount: savedFiles.length,
         estimatedCost: savedFiles.length * duration * veoPricePerSec,
       });
 
+      const uriHint = videoUris.length > 0
+        ? `\n\nVideo URIs (valid ~2 days, pass to extendFromVideoUri to extend):\n${videoUris.join("\n")}`
+        : "";
+
       return {
-        content: [{ type: "text", text: `Generated ${savedFiles.length} video(s):\n${savedFiles.join("\n")}` }],
+        content: [{ type: "text", text: `Generated ${savedFiles.length} video(s) with ${modelId}:\n${savedFiles.join("\n")}${uriHint}` }],
       };
     } catch (err) {
       if (err.message.includes("403") || err.message.includes("404")) {
