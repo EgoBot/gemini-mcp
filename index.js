@@ -117,6 +117,42 @@ function timestamp() {
   return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 }
 
+// Resolve the target dir for a generation: base is `absOverride` (an explicit absolute
+// outputDir) or ~/Desktop/gemini-outputs, optionally nested under a sanitized per-project/
+// purpose subfolder (nested paths ok; `..`/absolute segments stripped). Created if missing.
+function resolveOutDir(project, absOverride) {
+  const base = absOverride
+    ? path.resolve(absOverride.replace(/^~/, os.homedir()))
+    : getOutputDir();
+  const safe = String(project || "")
+    .split("/")
+    .map((s) => s.trim().replace(/[^A-Za-z0-9._-]/g, "-"))
+    .filter((s) => s && s !== "." && s !== "..")
+    .join("/");
+  const dir = safe ? path.join(base, safe) : base;
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// Write a plain-text sidecar next to a saved artifact: SAME basename, `.txt` extension.
+// Holds the exact prompt (the only reproduction handle — images have no seed) plus a
+// compact settings footer. Best-effort: never throws back into the caller.
+function writeSidecar(filepath, prompt, meta = {}) {
+  try {
+    const side = filepath.replace(/\.[^./]+$/, "") + ".txt";
+    const metaLines = Object.entries(meta)
+      .filter(([, v]) => v !== undefined && v !== null && v !== "" && !(Array.isArray(v) && v.length === 0))
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
+    const body = [prompt || ""]
+      .concat(metaLines.length ? ["", "----", ...metaLines] : [])
+      .join("\n") + "\n";
+    fs.writeFileSync(side, body);
+    return side;
+  } catch {
+    return null;
+  }
+}
+
 function readImageAsBase64(filePath) {
   const resolved = path.resolve(filePath.replace(/^~/, os.homedir()));
   if (!fs.existsSync(resolved)) {
@@ -221,7 +257,7 @@ const server = new McpServer({
 
 server.tool(
   "gemini_generate_image",
-  "Generate images from text using Google's Nano Banana image models (text-to-image). Produces 1-4 images per call (each a separate request). model='flash' (gemini-3.1-flash-image, default) is fast/cheap; model='pro' (gemini-3-pro-image) is the quality tier with far better in-image TEXT rendering (logos, signage, posters) — use it for hero/final/text work. For reference-image-guided generation or editing an existing image, use gemini_native_image instead. Saves PNG/JPG to ~/Desktop/gemini-outputs/.",
+  "Generate images from text using Google's Nano Banana image models (text-to-image). Produces 1-4 images per call (each a separate request). model='flash' (gemini-3.1-flash-image, default) is fast/cheap; model='pro' (gemini-3-pro-image) is the quality tier with far better in-image TEXT rendering (logos, signage, posters) — use it for hero/final/text work. For reference-image-guided generation or editing an existing image, use gemini_native_image instead. Saves PNG/JPG to ~/Desktop/gemini-outputs/ (pass 'project' to nest outputs in a per-project/purpose subfolder; each image also gets a same-named .txt sidecar with the prompt + settings for reproduction).",
   {
     prompt: z.string().describe("Text description of the image to generate"),
     model: z
@@ -247,8 +283,12 @@ server.tool(
       .enum(["dont_allow", "allow_adult", "allow_all"])
       .default("allow_adult")
       .describe("Person/face generation policy"),
+    project: z
+      .string()
+      .optional()
+      .describe("Optional subfolder under ~/Desktop/gemini-outputs to group outputs by project/purpose (e.g. 'odyssey-retold/heroes'). Nested paths allowed; sanitized; created if missing. Omit to save in the root."),
   },
-  async ({ prompt, model, aspectRatio, sampleCount, imageSize, personGeneration }) => {
+  async ({ prompt, model, aspectRatio, sampleCount, imageSize, personGeneration, project }) => {
     if (!hasKeys()) {
       return { content: [{ type: "text", text: "Error: GEMINI_API_KEY environment variable is not set." }] };
     }
@@ -256,7 +296,7 @@ server.tool(
     const modelId = IMAGE_MODELS[model] || IMAGE_MODELS[DEFAULT_IMAGE_MODEL];
 
     try {
-      const outputDir = getOutputDir();
+      const outputDir = resolveOutDir(project);
       const savedFiles = [];
       const textParts = [];
       const errors = [];
@@ -295,6 +335,7 @@ server.tool(
               const filepath = path.join(outputDir, filename);
               fs.writeFileSync(filepath, buffer);
               savedFiles.push(filepath);
+              writeSidecar(filepath, prompt, { tool: "gemini_generate_image", model: modelId, aspectRatio, imageSize });
               gotImage = true;
             }
           }
@@ -336,7 +377,7 @@ server.tool(
 
 server.tool(
   "gemini_native_image",
-  "Generate or edit images using Google's Nano Banana image models. Supports multiple input images, image editing, multi-turn style, and up to 4K — this is the consistency engine: chain from an approved reference via inputImagePaths to keep a face/place/object identical. model='flash' (gemini-3.1-flash-image, default) is the fast workhorse for chaining/bulk; model='pro' (gemini-3-pro-image) is the quality tier with far better in-image TEXT rendering — use for hero/final/text work. Saves PNG/JPG to ~/Desktop/gemini-outputs/.",
+  "Generate or edit images using Google's Nano Banana image models. Supports multiple input images, image editing, multi-turn style, and up to 4K — this is the consistency engine: chain from an approved reference via inputImagePaths to keep a face/place/object identical. model='flash' (gemini-3.1-flash-image, default) is the fast workhorse for chaining/bulk; model='pro' (gemini-3-pro-image) is the quality tier with far better in-image TEXT rendering — use for hero/final/text work. Saves PNG/JPG to ~/Desktop/gemini-outputs/ (pass 'project' to nest outputs in a per-project/purpose subfolder; each image also gets a same-named .txt sidecar with the prompt + settings for reproduction).",
   {
     prompt: z.string().describe("Text description or editing instruction"),
     model: z
@@ -359,8 +400,12 @@ server.tool(
       .enum(["dont_allow", "allow_adult", "allow_all"])
       .default("allow_adult")
       .describe("Person/face generation policy"),
+    project: z
+      .string()
+      .optional()
+      .describe("Optional subfolder under ~/Desktop/gemini-outputs to group outputs by project/purpose (e.g. 'odyssey-retold/heroes'). Nested paths allowed; sanitized; created if missing. Omit to save in the root."),
   },
-  async ({ prompt, model, aspectRatio, imageSize, inputImagePaths, personGeneration }) => {
+  async ({ prompt, model, aspectRatio, imageSize, inputImagePaths, personGeneration, project }) => {
     if (!hasKeys()) {
       return { content: [{ type: "text", text: "Error: GEMINI_API_KEY environment variable is not set." }] };
     }
@@ -419,7 +464,7 @@ server.tool(
         return { content: [{ type: "text", text: `No content returned. Debug: ${debugInfo}` }] };
       }
 
-      const outputDir = getOutputDir();
+      const outputDir = resolveOutDir(project);
       const savedFiles = [];
       const textParts = [];
 
@@ -439,6 +484,7 @@ server.tool(
             const filepath = path.join(outputDir, filename);
             fs.writeFileSync(filepath, buffer);
             savedFiles.push(filepath);
+            writeSidecar(filepath, prompt, { tool: "gemini_native_image", model: modelId, aspectRatio, imageSize, refs: inputImagePaths });
           }
         }
       }
@@ -477,7 +523,7 @@ server.tool(
 
 server.tool(
   "gemini_generate_video",
-  "Generate a video using Google Veo 3.1 with native audio. Supports text-to-video, image-to-video (start frame), first+last frame interpolation (seamless loops), reference-image character/style consistency (ingredients-to-video, up to 3), and extension of a previous Veo-generated video URI. Saves MP4 to ~/Desktop/gemini-outputs/ unless outputDir is set. KEY POOL & FAILOVER: this server loads an API-key pool (GEMINI_API_KEYS comma-list, then GEMINI_API_KEY). It uses key 0 by default and AUTOMATICALLY rotates to the next key when one returns 429 / quota / a monthly spend-cap. To force a specific key pass keyIndex (0-based). If a call returns 'All N pooled keys exhausted', every key is blocked — raise a spend cap at https://ai.studio/spend or add another key to GEMINI_API_KEYS.",
+  "Generate a video using Google Veo 3.1 with native audio. Supports text-to-video, image-to-video (start frame), first+last frame interpolation (seamless loops), reference-image character/style consistency (ingredients-to-video, up to 3), and extension of a previous Veo-generated video URI. Saves MP4 to ~/Desktop/gemini-outputs/ unless outputDir is set (pass 'project' to nest in a per-project/purpose subfolder; each MP4 also gets a same-named .txt sidecar with the prompt + settings). KEY POOL & FAILOVER: this server loads an API-key pool (GEMINI_API_KEYS comma-list, then GEMINI_API_KEY). It uses key 0 by default and AUTOMATICALLY rotates to the next key when one returns 429 / quota / a monthly spend-cap. To force a specific key pass keyIndex (0-based). If a call returns 'All N pooled keys exhausted', every key is blocked — raise a spend cap at https://ai.studio/spend or add another key to GEMINI_API_KEYS.",
   {
     prompt: z.string().describe("Text description of the video to generate"),
     negativePrompt: z
@@ -531,8 +577,12 @@ server.tool(
       .string()
       .optional()
       .describe("Optional: absolute path to write MP4(s) to. Defaults to ~/Desktop/gemini-outputs/."),
+    project: z
+      .string()
+      .optional()
+      .describe("Optional subfolder to group outputs by project/purpose (e.g. 'odyssey-retold/broll'), nested under outputDir or ~/Desktop/gemini-outputs. Sanitized; created if missing."),
   },
-  async ({ prompt, negativePrompt, keyIndex, model, durationSeconds, aspectRatio, resolution, inputImagePath, lastFramePath, referenceImagePaths, extendFromVideoUri, personGeneration, outputDir }, extra) => {
+  async ({ prompt, negativePrompt, keyIndex, model, durationSeconds, aspectRatio, resolution, inputImagePath, lastFramePath, referenceImagePaths, extendFromVideoUri, personGeneration, outputDir, project }, extra) => {
     if (!hasKeys()) {
       return { content: [{ type: "text", text: "Error: GEMINI_API_KEY environment variable is not set." }] };
     }
@@ -706,9 +756,7 @@ server.tool(
         return { content: [{ type: "text", text: "No video returned. The prompt may have been blocked by safety filters." }] };
       }
 
-      const resolvedOutputDir = outputDir
-        ? (fs.mkdirSync(path.resolve(outputDir.replace(/^~/, os.homedir())), { recursive: true }), path.resolve(outputDir.replace(/^~/, os.homedir())))
-        : getOutputDir();
+      const resolvedOutputDir = resolveOutDir(project, outputDir);
       const savedFiles = [];
       const videoUris = [];
 
@@ -730,6 +778,7 @@ server.tool(
         const filepath = path.join(resolvedOutputDir, filename);
         fs.writeFileSync(filepath, videoBuffer);
         savedFiles.push(filepath);
+        writeSidecar(filepath, prompt, { tool: "gemini_generate_video", model: modelId, aspectRatio, resolution, durationSeconds: duration, refs: referenceImagePaths, startFrame: inputImagePath, lastFrame: lastFramePath });
       }
 
       // Log usage
