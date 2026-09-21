@@ -55,6 +55,7 @@ const USAGE_LOG_PATH = path.join(os.homedir(), "Desktop", "gemini-outputs", "usa
 const IMAGE_MODELS = {
   flash: "gemini-3.1-flash-image",
   pro: "gemini-3-pro-image",
+  lite: "gemini-3.1-flash-lite-image", // cheapest; 1K only; weak at multi-reference / sequential edits
 };
 const DEFAULT_IMAGE_MODEL = "flash";
 
@@ -63,21 +64,18 @@ const DEFAULT_IMAGE_MODEL = "flash";
 const PRICING = {
   "gemini-3.1-flash-image": { "512": 0.045, "1K": 0.067, "2K": 0.101, "4K": 0.151 }, // Nano Banana (Flash)
   "gemini-3-pro-image":     { "512": 0.134, "1K": 0.134, "2K": 0.134, "4K": 0.24 },  // Nano Banana Pro
-  "imagen-4.0-generate-001": { "1K": 0.04, "2K": 0.06 },          // legacy, removed 2026-08-17
-  "veo-3.1-generate-preview": { perSecond: 0.40 },                 // quality, with audio
-  "veo-3.1-fast-generate-preview": { perSecond: 0.15 },            // fast, with audio
-  "veo-3.1-lite-generate-preview": { perSecond: 0.08 },            // lite (estimate; verify)
-  "veo-3.0-generate-001": { perSecond: 0.40 },                     // GA quality
-  "veo-3.0-fast-generate-001": { perSecond: 0.15 },               // GA fast
+  "gemini-3.1-flash-lite-image": { "1K": 0.0336 },                 // Nano Banana 2 Lite
+  // Veo 3.1 (USD per second, with audio), by resolution. Verified 2026-09-21.
+  "veo-3.1-generate-preview":      { perSecond: { "720p": 0.40, "1080p": 0.40, "4k": 0.60 } },
+  "veo-3.1-fast-generate-preview": { perSecond: { "720p": 0.10, "1080p": 0.12, "4k": 0.30 } },
+  "veo-3.1-lite-generate-preview": { perSecond: { "720p": 0.05, "1080p": 0.08 } }, // no 4k
 };
 
 const VEO_MODELS = {
   quality: "veo-3.1-generate-preview",
   fast: "veo-3.1-fast-generate-preview",
   lite: "veo-3.1-lite-generate-preview",
-  // Veo 3.0 GA (production quotas: ~50 RPM, higher daily cap). No reference-images.
-  "quality-ga": "veo-3.0-generate-001",
-  "fast-ga": "veo-3.0-fast-generate-001",
+  // Veo 3.0 (veo-3.0-*-001) is gone from Google's model list (404); removed 2026-09-21.
 };
 
 function logUsage({ tool, model, params, outputCount, estimatedCost }) {
@@ -261,9 +259,9 @@ server.tool(
   {
     prompt: z.string().describe("Text description of the image to generate"),
     model: z
-      .enum(["flash", "pro"])
+      .enum(["flash", "pro", "lite"])
       .default("flash")
-      .describe("flash = gemini-3.1-flash-image (fast, cheap, default); pro = gemini-3-pro-image (best fidelity + in-image text, ~2x cost, ~4x slower)."),
+      .describe("flash = gemini-3.1-flash-image (fast, cheap, default); pro = gemini-3-pro-image (best fidelity + in-image text, ~2x cost, ~4x slower); lite = gemini-3.1-flash-lite-image (cheapest ~$0.034, 1K only, weak at reference-heavy edits; for bulk drafts)."),
     aspectRatio: z
       .enum(["1:1", "1:4", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"])
       .default("1:1")
@@ -279,6 +277,10 @@ server.tool(
       .enum(["512", "1K", "2K", "4K"])
       .default("1K")
       .describe("Output resolution: 512 (0.5K), 1K, 2K, or 4K"),
+    thinkingLevel: z
+      .enum(["minimal", "high"])
+      .optional()
+      .describe("Optional reasoning depth for the 3.1 models (flash, lite): 'high' plans composition before drawing (better on complex prompts, slower). Ignored for pro. Omit for Google's default (minimal)."),
     personGeneration: z
       .enum(["dont_allow", "allow_adult", "allow_all"])
       .default("allow_adult")
@@ -288,12 +290,16 @@ server.tool(
       .optional()
       .describe("Optional subfolder under ~/Desktop/gemini-outputs to group outputs by project/purpose (e.g. 'odyssey-retold/heroes'). Nested paths allowed; sanitized; created if missing. Omit to save in the root."),
   },
-  async ({ prompt, model, aspectRatio, sampleCount, imageSize, personGeneration, project }) => {
+  async ({ prompt, model, aspectRatio, sampleCount, imageSize, thinkingLevel, personGeneration, project }) => {
     if (!hasKeys()) {
       return { content: [{ type: "text", text: "Error: GEMINI_API_KEY environment variable is not set." }] };
     }
 
     const modelId = IMAGE_MODELS[model] || IMAGE_MODELS[DEFAULT_IMAGE_MODEL];
+    if (model === "lite" && imageSize !== "1K") {
+      return { content: [{ type: "text", text: "Error: model='lite' supports imageSize '1K' only." }] };
+    }
+    const genConfigExtra = thinkingLevel && model !== "pro" ? { thinkingConfig: { thinkingLevel } } : {};
 
     try {
       const outputDir = resolveOutDir(project);
@@ -310,6 +316,7 @@ server.tool(
               generationConfig: {
                 responseModalities: ["TEXT", "IMAGE"],
                 imageConfig: { aspectRatio, imageSize },
+                ...genConfigExtra,
               },
               safetySettings: [
                 {
@@ -335,7 +342,7 @@ server.tool(
               const filepath = path.join(outputDir, filename);
               fs.writeFileSync(filepath, buffer);
               savedFiles.push(filepath);
-              writeSidecar(filepath, prompt, { tool: "gemini_generate_image", model: modelId, aspectRatio, imageSize });
+              writeSidecar(filepath, prompt, { tool: "gemini_generate_image", model: modelId, aspectRatio, imageSize, thinkingLevel });
               gotImage = true;
             }
           }
@@ -381,9 +388,9 @@ server.tool(
   {
     prompt: z.string().describe("Text description or editing instruction"),
     model: z
-      .enum(["flash", "pro"])
+      .enum(["flash", "pro", "lite"])
       .default("flash")
-      .describe("flash = gemini-3.1-flash-image (fast, cheap, default); pro = gemini-3-pro-image (best fidelity + in-image text, ~2x cost, ~4x slower)."),
+      .describe("flash = gemini-3.1-flash-image (fast, cheap, default); pro = gemini-3-pro-image (best fidelity + in-image text, ~2x cost, ~4x slower); lite = gemini-3.1-flash-lite-image (cheapest ~$0.034, 1K only, weak at reference-heavy edits; for bulk drafts)."),
     aspectRatio: z
       .enum(["1:1", "1:4", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"])
       .default("1:1")
@@ -392,6 +399,10 @@ server.tool(
       .enum(["512", "1K", "2K", "4K"])
       .default("1K")
       .describe("Output resolution"),
+    thinkingLevel: z
+      .enum(["minimal", "high"])
+      .optional()
+      .describe("Optional reasoning depth for the 3.1 models (flash, lite): 'high' plans composition before drawing (better on complex prompts, slower). Ignored for pro. Omit for Google's default (minimal)."),
     inputImagePaths: z
       .array(z.string())
       .optional()
@@ -405,12 +416,16 @@ server.tool(
       .optional()
       .describe("Optional subfolder under ~/Desktop/gemini-outputs to group outputs by project/purpose (e.g. 'odyssey-retold/heroes'). Nested paths allowed; sanitized; created if missing. Omit to save in the root."),
   },
-  async ({ prompt, model, aspectRatio, imageSize, inputImagePaths, personGeneration, project }) => {
+  async ({ prompt, model, aspectRatio, imageSize, thinkingLevel, inputImagePaths, personGeneration, project }) => {
     if (!hasKeys()) {
       return { content: [{ type: "text", text: "Error: GEMINI_API_KEY environment variable is not set." }] };
     }
 
     const modelId = IMAGE_MODELS[model] || IMAGE_MODELS[DEFAULT_IMAGE_MODEL];
+    if (model === "lite" && imageSize !== "1K") {
+      return { content: [{ type: "text", text: "Error: model='lite' supports imageSize '1K' only." }] };
+    }
+    const genConfigExtra = thinkingLevel && model !== "pro" ? { thinkingConfig: { thinkingLevel } } : {};
 
     try {
       const parts = [];
@@ -440,6 +455,7 @@ server.tool(
               aspectRatio,
               imageSize,
             },
+            ...genConfigExtra,
           },
           safetySettings: [
             {
@@ -484,7 +500,7 @@ server.tool(
             const filepath = path.join(outputDir, filename);
             fs.writeFileSync(filepath, buffer);
             savedFiles.push(filepath);
-            writeSidecar(filepath, prompt, { tool: "gemini_native_image", model: modelId, aspectRatio, imageSize, refs: inputImagePaths });
+            writeSidecar(filepath, prompt, { tool: "gemini_native_image", model: modelId, aspectRatio, imageSize, thinkingLevel, refs: inputImagePaths });
           }
         }
       }
@@ -529,7 +545,13 @@ server.tool(
     negativePrompt: z
       .string()
       .optional()
-      .describe("Negative prompt (comma-separated nouns) Veo will suppress, e.g. 'camera motion, pan, tilt, zoom, dolly, blur, text, people, boats'."),
+      .describe("Negative prompt (comma-separated nouns) Veo will suppress, e.g. 'camera motion, pan, tilt, zoom, dolly, blur, text, people, boats'. Not supported on 'lite' (Google 400s)."),
+    seed: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Optional integer seed for more repeatable output (Veo 3.x; not fully deterministic). Note it in the sidecar to reproduce."),
     keyIndex: z
       .number()
       .int()
@@ -537,9 +559,9 @@ server.tool(
       .optional()
       .describe("Force a specific 0-based API key from the pool (skips 429 auto-rotation). Omit for normal behaviour."),
     model: z
-      .enum(["quality", "fast", "lite", "quality-ga", "fast-ga"])
+      .enum(["quality", "fast", "lite"])
       .default("quality")
-      .describe("Veo variant. 3.1 preview: quality (best), fast, lite. Veo 3.0 GA (higher quota, no reference-images): quality-ga, fast-ga."),
+      .describe("Veo 3.1 variant: quality (best, 4k ok), fast (4k ok), lite (cheapest; no 4k, no negativePrompt, no referenceImages, no extension)."),
     durationSeconds: z
       .enum(["4", "6", "8"])
       .default("6")
@@ -582,7 +604,7 @@ server.tool(
       .optional()
       .describe("Optional subfolder to group outputs by project/purpose (e.g. 'odyssey-retold/broll'), nested under outputDir or ~/Desktop/gemini-outputs. Sanitized; created if missing."),
   },
-  async ({ prompt, negativePrompt, keyIndex, model, durationSeconds, aspectRatio, resolution, inputImagePath, lastFramePath, referenceImagePaths, extendFromVideoUri, personGeneration, outputDir, project }, extra) => {
+  async ({ prompt, negativePrompt, seed, keyIndex, model, durationSeconds, aspectRatio, resolution, inputImagePath, lastFramePath, referenceImagePaths, extendFromVideoUri, personGeneration, outputDir, project }, extra) => {
     if (!hasKeys()) {
       return { content: [{ type: "text", text: "Error: GEMINI_API_KEY environment variable is not set." }] };
     }
@@ -598,6 +620,12 @@ server.tool(
     }
     if (model === "lite" && (usingReferences || usingExtension)) {
       return { content: [{ type: "text", text: "Error: referenceImages and extension are not supported on the 'lite' model. Use 'quality' or 'fast'." }] };
+    }
+    if (model === "lite" && resolution === "4k") {
+      return { content: [{ type: "text", text: "Error: the 'lite' model does not support 4k. Use 'quality' or 'fast', or resolution 720p/1080p." }] };
+    }
+    if (model === "lite" && negativePrompt) {
+      return { content: [{ type: "text", text: "Error: negativePrompt is not supported on the 'lite' model. Use 'quality' or 'fast', or fold the exclusions into the prompt." }] };
     }
     if (usingExtension && resolution !== "720p") {
       return { content: [{ type: "text", text: "Error: video extension requires resolution='720p'." }] };
@@ -661,6 +689,7 @@ server.tool(
       };
       if (personGeneration) parameters.personGeneration = personGeneration;
       if (negativePrompt) parameters.negativePrompt = negativePrompt;
+      if (seed !== undefined) parameters.seed = seed;
 
       // Step 1: Submit generation request.
       // If keyIndex is given, pin to that pool key (no rotation); otherwise
@@ -778,11 +807,11 @@ server.tool(
         const filepath = path.join(resolvedOutputDir, filename);
         fs.writeFileSync(filepath, videoBuffer);
         savedFiles.push(filepath);
-        writeSidecar(filepath, prompt, { tool: "gemini_generate_video", model: modelId, aspectRatio, resolution, durationSeconds: duration, refs: referenceImagePaths, startFrame: inputImagePath, lastFrame: lastFramePath });
+        writeSidecar(filepath, prompt, { tool: "gemini_generate_video", model: modelId, aspectRatio, resolution, durationSeconds: duration, seed, negativePrompt, refs: referenceImagePaths, startFrame: inputImagePath, lastFrame: lastFramePath });
       }
 
       // Log usage
-      const veoPricePerSec = PRICING[modelId]?.perSecond ?? 0.15;
+      const veoPricePerSec = PRICING[modelId]?.perSecond?.[resolution] ?? 0.40;
       logUsage({
         tool: "gemini_generate_video",
         model: modelId,
